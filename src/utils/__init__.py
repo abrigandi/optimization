@@ -1,1 +1,4 @@
-"""Utility functions for optimization toolkit."""
+"""Utilities for the optimization package.
+
+Add helper functions, IO, and small utilities here.
+"""

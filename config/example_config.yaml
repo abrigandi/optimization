@@ -1,0 +1,10 @@
+# Example configuration
+
+# General settings
+project_name: optimization
+log_level: INFO
+
+# Solver defaults
+solver:
+  max_iter: 1000
+  tol: 1e-6
