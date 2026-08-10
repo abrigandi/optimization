@@ -7,8 +7,9 @@ Steps performed:
 4) Print final solution
 5) Save results to file (JSON)
 6) Solve an exact MIP using PuLP to compare
+7) Produce a PNG visualization of facilities and assignments
 
-Requirements: numpy, pulp
+Requirements: numpy, pulp, matplotlib
 """
 import argparse
 import json
@@ -26,6 +27,13 @@ try:
     import pulp
 except Exception:
     pulp = None
+
+try:
+    import matplotlib.pyplot as plt
+    import matplotlib.cm as cm
+except Exception:
+    plt = None
+    cm = None
 
 
 def load_data(path):
@@ -192,7 +200,7 @@ def simulated_annealing(facilities, customers, dist, init_open, init_assignment,
 def solve_mip(facilities, customers, dist):
     if pulp is None:
         print("PuLP is not installed. Skipping MIP solve. Install pulp and re-run to enable MIP comparison.")
-        return None, None
+        return None, None, None
     m = len(facilities)
     n = len(customers)
     prob = pulp.LpProblem("CFLP", pulp.LpMinimize)
@@ -243,12 +251,70 @@ def save_results(out_dir, name, open_set, assignment, obj):
     print(f"Saved results to {path}")
 
 
+def visualize_and_save(out_dir, facilities, customers, assignment, open_set, filename="assignment.png"):
+    if plt is None:
+        print("matplotlib not installed. Skipping visualization. Install matplotlib to enable plotting.")
+        return
+    os.makedirs(out_dir, exist_ok=True)
+    fig, ax = plt.subplots(figsize=(8, 8))
+
+    # Prepare facility coords
+    fx = [f["x"] for f in facilities]
+    fy = [f["y"] for f in facilities]
+
+    # Customer coords
+    cx = [c["x"] for c in customers]
+    cy = [c["y"] for c in customers]
+    demands = [c["demand"] for c in customers]
+
+    m = len(facilities)
+    n = len(customers)
+
+    # Color customers by assigned facility (use a categorical colormap)
+    cmap = cm.get_cmap("tab20")
+    colors = [cmap(assignment[i] % 20) if assignment[i] is not None else (0.5, 0.5, 0.5, 1.0) for i in range(n)]
+
+    # Plot customers
+    sizes = [max(10, d * 2) for d in demands]
+    ax.scatter(cx, cy, c=colors, s=sizes, alpha=0.7, label="customers")
+
+    # Plot facilities: open and closed
+    open_mask = [j in open_set for j in range(m)]
+    open_fx = [fx[j] for j in range(m) if open_mask[j]]
+    open_fy = [fy[j] for j in range(m) if open_mask[j]]
+    closed_fx = [fx[j] for j in range(m) if not open_mask[j]]
+    closed_fy = [fy[j] for j in range(m) if not open_mask[j]]
+
+    ax.scatter(closed_fx, closed_fy, c="#444444", marker="s", s=80, label="closed facilities")
+    ax.scatter(open_fx, open_fy, c="#2ca02c", marker="*", s=180, edgecolors="black", label="open facilities")
+
+    # Draw assignment lines (thin, faint)
+    for i in range(n):
+        j = assignment[i]
+        if j is None:
+            continue
+        ax.plot([cx[i], fx[j]], [cy[i], fy[j]], c=colors[i], alpha=0.25, linewidth=0.7)
+
+    ax.set_title("Capacitated Facility Location — Assignments")
+    ax.legend(loc="upper right")
+    ax.set_xlabel("x")
+    ax.set_ylabel("y")
+    ax.set_aspect("equal", adjustable="box")
+
+    path = os.path.join(out_dir, filename)
+    fig.tight_layout()
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+    print(f"Saved visualization to {path}")
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--data", type=str, default="test-run/data/sample_data.json")
     parser.add_argument("--out-dir", type=str, default="test-run/results")
     parser.add_argument("--iters", type=int, default=2000)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--no-plot", action="store_true", help="Skip generating PNG visualization")
     args = parser.parse_args()
 
     random.seed(args.seed)
@@ -270,11 +336,16 @@ def main():
     print(f"SA best objective: {best_obj:.2f}, open facilities: {len(best_open)}")
     save_results(args.out_dir, "sa", best_open, best_assign, best_obj)
 
+    if not args.no_plot:
+        visualize_and_save(args.out_dir, facilities, customers, best_assign, best_open, filename="sa_assignment.png")
+
     print("Solving MIP (exact)...")
     mip_open, mip_assign, mip_obj = solve_mip(facilities, customers, dist)
     if mip_obj is not None:
         print(f"MIP objective: {mip_obj:.2f}, open facilities: {len(mip_open)}")
         save_results(args.out_dir, "mip", mip_open, mip_assign, mip_obj)
+        if not args.no_plot:
+            visualize_and_save(args.out_dir, facilities, customers, mip_assign, mip_open, filename="mip_assignment.png")
 
     print("Final SA solution (sample):")
     # print a compact representation
