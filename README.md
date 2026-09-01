@@ -82,8 +82,22 @@ You can compute the optimality gap as: `(SA_obj - MIP_obj) / MIP_obj * 100%` (if
 
 - PuLP ships with the CBC solver by default. If you have another solver (Gurobi, CPLEX, etc.) installed and configured with PuLP, the MIP solve may be faster and handle larger instances.
 - Increase the `--iters` parameter passed to `test-run/run.py` to give SA more search time for larger instances.
-- The greedy initial solution and neighborhoods are intentionally simple to be easy to understand and modify; consider implementing more advanced heuristics (relocate, k-swap, multi-open) for improved results.
+- The test run supports Simulated Annealing (`--method sa`), hill climbing, Tabu Search, Iterated Local Search (`ils`), and Variable Neighborhood Search (`vns`).
+- Use `--neighborhoods open,close,swap,double_swap,shake` to control the move mix. The available neighborhoods are documented in `test-run/README.md`.
 - If you plan to run many experiments in Codespaces, consider adding a devcontainer that pre-installs dependencies and optionally a solver.
+
+## Important: Deleting your Codespace
+
+If you **delete the Codespace**, you will lose the `.venv` folder and all installed packages. When you open the repository again in a new Codespace, you will need to **repeat steps 1-3** (create venv, activate it, and install requirements):
+
+```bash
+python -m venv .venv
+source .venv/bin/activate        # Linux / macOS
+.venv\Scripts\activate          # Windows
+pip install -r requirements.txt
+```
+
+After that, you can proceed with steps 4-5 to run the experiments.
 
 ## Running outside Codespaces
 

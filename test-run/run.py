@@ -103,6 +103,74 @@ def greedy_initial_solution(facilities, customers, dist):
     return list(open_set), assignment
 
 
+def constructive_solution(facilities, customers, dist, method="greedy", randomness=0.0):
+    """Build a feasible solution using a selectable constructive rule."""
+    m = len(facilities)
+    n = len(customers)
+    if method == "greedy":
+        return greedy_initial_solution(facilities, customers, dist)
+
+    remaining = set(range(n))
+    open_set = set()
+    capacities = [facility["capacity"] for facility in facilities]
+    assignment = [-1] * n
+
+    while remaining:
+        candidates = []
+        for j in range(m):
+            if j in open_set:
+                continue
+            feasible = [i for i in remaining if customers[i]["demand"] <= capacities[j]]
+            if not feasible:
+                continue
+            covered = sum(customers[i]["demand"] for i in feasible)
+            if method == "cost_benefit":
+                score = covered / max(1.0, facilities[j]["fixed_cost"])
+            elif method == "demand_weighted":
+                score = sum(customers[i]["demand"] / max(1e-9, dist[i][j]) for i in feasible)
+            elif method == "savings":
+                nearest = sum(min(dist[i]) * customers[i]["demand"] for i in feasible)
+                score = (nearest - sum(dist[i][j] * customers[i]["demand"] for i in feasible)) / max(1.0, facilities[j]["fixed_cost"])
+            else:  # dual_based: reduced-cost proxy from demand pressure and fixed cost
+                pressure = sum(customers[i]["demand"] * (1.0 + dist[i][j]) ** -1 for i in feasible)
+                score = pressure / max(1.0, facilities[j]["fixed_cost"] / max(1, facilities[j]["capacity"]))
+            candidates.append((score, j, feasible))
+        if not candidates:
+            return greedy_initial_solution(facilities, customers, dist)
+        candidates.sort(reverse=True)
+        pool_size = min(len(candidates), max(1, int(1 + randomness * len(candidates))))
+        _, facility, _ = random.choice(candidates[:pool_size])
+        open_set.add(facility)
+        feasible = sorted(remaining, key=lambda i: (dist[i][facility], -customers[i]["demand"]))
+        for i in feasible:
+            if customers[i]["demand"] <= capacities[facility]:
+                assignment[i] = facility
+                capacities[facility] -= customers[i]["demand"]
+                remaining.remove(i)
+
+    return list(open_set), assignment
+
+
+def greedy_repair_assignment(open_set, assignment, facilities, customers, dist):
+    """Repair assignments after a customer-level neighborhood move."""
+    m = len(facilities)
+    capacities = [facilities[j]["capacity"] for j in range(m)]
+    repaired = [-1] * len(customers)
+    order = sorted(range(len(customers)), key=lambda i: customers[i]["demand"], reverse=True)
+    for i in order:
+        preferred = assignment[i] if 0 <= assignment[i] < m else None
+        choices = list(open_set)
+        choices.sort(key=lambda j: (j != preferred, dist[i][j]))
+        for j in choices:
+            if capacities[j] >= customers[i]["demand"]:
+                repaired[i] = j
+                capacities[j] -= customers[i]["demand"]
+                break
+        if repaired[i] == -1:
+            return None
+    return repaired
+
+
 def objective(open_set, assignment, facilities, customers, dist):
     fixed = sum(facilities[j]["fixed_cost"] for j in set(open_set))
     assign_cost = 0.0
@@ -131,10 +199,10 @@ def reassign_to_nearest(open_set, facilities, customers, dist):
     return assignment
 
 
-def neighborhood_move(open_set, facilities, customers, dist):
+def neighborhood_move(open_set, facilities, customers, dist, move_type=None):
     m = len(facilities)
     open_set = set(open_set)
-    move_type = random.choice(["open", "close", "swap"])
+    move_type = move_type or random.choice(["open", "close", "swap", "double_swap", "shake"])
     if move_type == "open":
         closed = [j for j in range(m) if j not in open_set]
         if not closed:
@@ -154,7 +222,7 @@ def neighborhood_move(open_set, facilities, customers, dist):
         if assign is None:
             open_set.add(j)
         return list(open_set)
-    else:  # swap
+    elif move_type == "swap":
         closed = [j for j in range(m) if j not in open_set]
         if not closed or len(open_set) == 0:
             return list(open_set)
@@ -167,9 +235,81 @@ def neighborhood_move(open_set, facilities, customers, dist):
             open_set.remove(j_closed)
             open_set.add(j_open)
         return list(open_set)
+    elif move_type == "double_swap":
+        closed = [j for j in range(m) if j not in open_set]
+        if len(open_set) < 2 or len(closed) < 2:
+            return list(open_set)
+        old = random.sample(list(open_set), 2)
+        new = random.sample(closed, 2)
+        candidate = (open_set - set(old)) | set(new)
+        if reassign_to_nearest(candidate, facilities, customers, dist) is not None:
+            return list(candidate)
+        return list(open_set)
+    else:  # shake: change several facilities to escape a local optimum
+        closed = [j for j in range(m) if j not in open_set]
+        swaps = min(random.randint(2, 4), len(open_set), len(closed))
+        if swaps == 0:
+            return list(open_set)
+        old = random.sample(list(open_set), swaps)
+        new = random.sample(closed, swaps)
+        candidate = (open_set - set(old)) | set(new)
+        if reassign_to_nearest(candidate, facilities, customers, dist) is not None:
+            return list(candidate)
+        return list(open_set)
 
 
-def simulated_annealing(facilities, customers, dist, init_open, init_assignment, iters=5000, t0=1000.0, alpha=0.995):
+def evaluate_solution(open_set, facilities, customers, dist):
+    assignment = reassign_to_nearest(open_set, facilities, customers, dist)
+    if assignment is None:
+        return None
+    return assignment, objective(open_set, assignment, facilities, customers, dist)
+
+
+def random_candidate(open_set, facilities, customers, dist, neighborhoods):
+    move = random.choice(neighborhoods)
+    candidate_open = neighborhood_move(open_set, facilities, customers, dist, move)
+    evaluated = evaluate_solution(candidate_open, facilities, customers, dist)
+    if evaluated is None:
+        return list(open_set), None, float("inf")
+    assignment, value = evaluated
+    return candidate_open, assignment, value
+
+
+def solution_neighborhood_move(open_set, assignment, facilities, customers, dist, move_type):
+    """Apply facility and customer-level neighborhoods to a full solution."""
+    candidate_open = set(open_set)
+    candidate_assignment = list(assignment)
+    if move_type in {"open", "close", "swap", "double_swap", "shake"}:
+        candidate_open = set(neighborhood_move(candidate_open, facilities, customers, dist, move_type))
+        candidate_assignment = reassign_to_nearest(candidate_open, facilities, customers, dist)
+    elif move_type == "relocate":
+        customer = random.randrange(len(customers))
+        alternatives = [j for j in candidate_open if j != candidate_assignment[customer]]
+        if alternatives:
+            candidate_assignment[customer] = min(alternatives, key=lambda j: dist[customer][j])
+    else:  # reassignment_cluster: move a geographically related customer group
+        anchor = random.randrange(len(customers))
+        cluster = sorted(range(len(customers)), key=lambda i: dist[anchor][candidate_assignment[i]])[:max(2, len(customers) // 10)]
+        for customer in cluster:
+            alternatives = [j for j in candidate_open if j != candidate_assignment[customer]]
+            if alternatives:
+                candidate_assignment[customer] = min(alternatives, key=lambda j: dist[customer][j])
+    if candidate_assignment is None:
+        return list(open_set), None, float("inf")
+    repaired = greedy_repair_assignment(candidate_open, candidate_assignment, facilities, customers, dist)
+    if repaired is None:
+        return list(open_set), None, float("inf")
+    return list(candidate_open), repaired, objective(candidate_open, repaired, facilities, customers, dist)
+
+
+def random_solution_candidate(solution, facilities, customers, dist, neighborhoods):
+    return solution_neighborhood_move(
+        solution[0], solution[1], facilities, customers, dist, random.choice(neighborhoods)
+    )
+
+
+def simulated_annealing(facilities, customers, dist, init_open, init_assignment, iters=5000, t0=1000.0, alpha=0.995, neighborhoods=None):
+    neighborhoods = neighborhoods or ["open", "close", "swap", "double_swap", "shake"]
     current_open = list(init_open)
     current_assignment = list(init_assignment)
     current_obj = objective(current_open, current_assignment, facilities, customers, dist)
@@ -179,11 +319,11 @@ def simulated_annealing(facilities, customers, dist, init_open, init_assignment,
     T = t0
 
     for k in range(iters):
-        cand_open = neighborhood_move(current_open, facilities, customers, dist)
-        cand_assignment = reassign_to_nearest(cand_open, facilities, customers, dist)
+        cand_open, cand_assignment, cand_obj = random_candidate(
+            current_open, facilities, customers, dist, neighborhoods
+        )
         if cand_assignment is None:
             continue
-        cand_obj = objective(cand_open, cand_assignment, facilities, customers, dist)
         delta = cand_obj - current_obj
         if delta < 0 or random.random() < math.exp(-delta / max(1e-9, T)):
             current_open = cand_open
@@ -195,6 +335,75 @@ def simulated_annealing(facilities, customers, dist, init_open, init_assignment,
                 best_obj = current_obj
         T *= alpha
     return best_open, best_assignment, best_obj
+
+
+def hill_climbing(facilities, customers, dist, init_open, init_assignment, iters=5000, neighborhoods=None):
+    neighborhoods = neighborhoods or ["open", "close", "swap"]
+    current_open = list(init_open)
+    current_assignment = list(init_assignment)
+    current_obj = objective(current_open, current_assignment, facilities, customers, dist)
+    for _ in range(iters):
+        cand_open, cand_assignment, cand_obj = random_candidate(
+            current_open, facilities, customers, dist, neighborhoods
+        )
+        if cand_assignment is not None and cand_obj < current_obj:
+            current_open, current_assignment, current_obj = cand_open, cand_assignment, cand_obj
+    return current_open, current_assignment, current_obj
+
+
+def tabu_search(facilities, customers, dist, init_open, init_assignment, iters=5000, tenure=12, neighborhoods=None):
+    neighborhoods = neighborhoods or ["open", "close", "swap", "double_swap"]
+    current_open = list(init_open)
+    current_assignment = list(init_assignment)
+    current_obj = objective(current_open, current_assignment, facilities, customers, dist)
+    best_open, best_assignment, best_obj = list(current_open), list(current_assignment), current_obj
+    tabu = {}
+    for iteration in range(iters):
+        candidates = []
+        for _ in range(min(20, max(4, len(facilities)))):
+            candidate = random_candidate(current_open, facilities, customers, dist, neighborhoods)
+            if candidate[1] is not None:
+                candidates.append(candidate)
+        if not candidates:
+            continue
+        allowed = [candidate for candidate in candidates
+                   if tuple(sorted(candidate[0])) not in tabu or candidate[2] < best_obj]
+        if not allowed:
+            allowed = candidates
+        current_open, current_assignment, current_obj = min(allowed, key=lambda item: item[2])
+        tabu[tuple(sorted(current_open))] = iteration + tenure
+        tabu = {key: expiry for key, expiry in tabu.items() if expiry > iteration}
+        if current_obj < best_obj:
+            best_open, best_assignment, best_obj = list(current_open), list(current_assignment), current_obj
+    return best_open, best_assignment, best_obj
+
+
+def iterated_local_search(facilities, customers, dist, init_open, init_assignment, iters=5000, neighborhoods=None):
+    neighborhoods = neighborhoods or ["open", "close", "swap"]
+    best = hill_climbing(facilities, customers, dist, init_open, init_assignment, max(1, iters // 5), neighborhoods)
+    for _ in range(5):
+        shaken = neighborhood_move(best[0], facilities, customers, dist, "shake")
+        evaluated = evaluate_solution(shaken, facilities, customers, dist)
+        if evaluated is None:
+            continue
+        candidate = hill_climbing(facilities, customers, dist, shaken, evaluated[0], max(1, iters // 5), neighborhoods)
+        if candidate[2] < best[2]:
+            best = candidate
+    return best
+
+
+def variable_neighborhood_search(facilities, customers, dist, init_open, init_assignment, iters=5000, neighborhoods=None):
+    neighborhoods = neighborhoods or ["swap", "double_swap", "open", "close"]
+    current = (list(init_open), list(init_assignment), objective(init_open, init_assignment, facilities, customers, dist))
+    for move in neighborhoods:
+        candidate_open = neighborhood_move(current[0], facilities, customers, dist, move)
+        evaluated = evaluate_solution(candidate_open, facilities, customers, dist)
+        if evaluated is None:
+            continue
+        candidate = hill_climbing(facilities, customers, dist, candidate_open, evaluated[0], max(1, iters // len(neighborhoods)), [move])
+        if candidate[2] < current[2]:
+            current = candidate
+    return current
 
 
 def solve_mip(facilities, customers, dist):
@@ -271,7 +480,7 @@ def visualize_and_save(out_dir, facilities, customers, assignment, open_set, fil
     n = len(customers)
 
     # Color customers by assigned facility (use a categorical colormap)
-    cmap = cm.get_cmap("tab20")
+    cmap = plt.get_cmap("tab20")
     colors = [cmap(assignment[i] % 20) if assignment[i] is not None else (0.5, 0.5, 0.5, 1.0) for i in range(n)]
 
     # Plot customers
@@ -314,10 +523,35 @@ def main():
     parser.add_argument("--out-dir", type=str, default="test-run/results")
     parser.add_argument("--iters", type=int, default=2000)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--method",
+        choices=["sa", "hill_climbing", "tabu", "ils", "vns"],
+        default="sa",
+        help="Metaheuristic to run (default: sa)",
+    )
+    parser.add_argument(
+        "--initializer",
+        choices=["greedy", "cost_benefit", "demand_weighted", "savings", "dual_based"],
+        default="greedy",
+        help="Constructive heuristic for the initial solution (default: greedy)",
+    )
+    parser.add_argument(
+        "--initializer-randomness",
+        type=float,
+        default=0.0,
+        help="Randomness for constructive selection, from 0.0 to 1.0",
+    )
+    parser.add_argument(
+        "--neighborhoods",
+        default="open,close,swap,double_swap,shake",
+        help="Comma-separated neighborhoods: open, close, swap, double_swap, shake",
+    )
     parser.add_argument("--no-plot", action="store_true", help="Skip generating PNG visualization")
     args = parser.parse_args()
 
     random.seed(args.seed)
+    if not 0.0 <= args.initializer_randomness <= 1.0:
+        parser.error("--initializer-randomness must be between 0.0 and 1.0")
     if np is None:
         print("Warning: numpy not installed; running without numpy (slower/math)\nInstall numpy for better performance.")
 
@@ -325,19 +559,47 @@ def main():
     dist = compute_distances(facilities, customers)
 
     print("Building initial solution...")
-    init_open, init_assign = greedy_initial_solution(facilities, customers, dist)
-    init_obj = objective(init_open, init_assign, facilities, customers, dist)
-    print(f"Initial objective: {init_obj:.2f}, open facilities: {len(init_open)}")
-
-    print("Running simulated annealing...")
-    best_open, best_assign, best_obj = simulated_annealing(
-        facilities, customers, dist, init_open, init_assign, iters=args.iters, t0=1000.0, alpha=0.995
+    init_open, init_assign = constructive_solution(
+        facilities, customers, dist, method=args.initializer, randomness=args.initializer_randomness
     )
-    print(f"SA best objective: {best_obj:.2f}, open facilities: {len(best_open)}")
-    save_results(args.out_dir, "sa", best_open, best_assign, best_obj)
+    init_obj = objective(init_open, init_assign, facilities, customers, dist)
+    print(f"Initial objective ({args.initializer}): {init_obj:.2f}, open facilities: {len(init_open)}")
+
+    neighborhoods = [name.strip() for name in args.neighborhoods.split(",") if name.strip()]
+    valid_neighborhoods = {"open", "close", "swap", "double_swap", "shake"}
+    unknown = set(neighborhoods) - valid_neighborhoods
+    if not neighborhoods or unknown:
+        parser.error("--neighborhoods must contain only open, close, swap, double_swap, shake")
+
+    print(f"Running {args.method}...")
+    methods = {
+        "sa": lambda: simulated_annealing(
+            facilities, customers, dist, init_open, init_assign,
+            iters=args.iters, t0=1000.0, alpha=0.995, neighborhoods=neighborhoods,
+        ),
+        "hill_climbing": lambda: hill_climbing(
+            facilities, customers, dist, init_open, init_assign,
+            iters=args.iters, neighborhoods=neighborhoods,
+        ),
+        "tabu": lambda: tabu_search(
+            facilities, customers, dist, init_open, init_assign,
+            iters=args.iters, neighborhoods=neighborhoods,
+        ),
+        "ils": lambda: iterated_local_search(
+            facilities, customers, dist, init_open, init_assign,
+            iters=args.iters, neighborhoods=neighborhoods,
+        ),
+        "vns": lambda: variable_neighborhood_search(
+            facilities, customers, dist, init_open, init_assign,
+            iters=args.iters, neighborhoods=neighborhoods,
+        ),
+    }
+    best_open, best_assign, best_obj = methods[args.method]()
+    print(f"{args.method} best objective: {best_obj:.2f}, open facilities: {len(best_open)}")
+    save_results(args.out_dir, args.method, best_open, best_assign, best_obj)
 
     if not args.no_plot:
-        visualize_and_save(args.out_dir, facilities, customers, best_assign, best_open, filename="sa_assignment.png")
+        visualize_and_save(args.out_dir, facilities, customers, best_assign, best_open, filename=f"{args.method}_assignment.png")
 
     print("Solving MIP (exact)...")
     mip_open, mip_assign, mip_obj = solve_mip(facilities, customers, dist)
@@ -347,7 +609,7 @@ def main():
         if not args.no_plot:
             visualize_and_save(args.out_dir, facilities, customers, mip_assign, mip_open, filename="mip_assignment.png")
 
-    print("Final SA solution (sample):")
+    print(f"Final {args.method} solution (sample):")
     # print a compact representation
     print("Open facilities:", best_open)
     print("First 10 assignments (customer -> facility):")
